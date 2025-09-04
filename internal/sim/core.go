@@ -22,9 +22,10 @@ type CoreOptions struct {
 
 // Core is the simulation core; it owns state and pluggable handlers.
 type Core struct {
-	mu      sync.RWMutex
-	opts    CoreOptions
-	profile Profile
+	mu       sync.RWMutex
+	opts     CoreOptions
+	profile  Profile
+	provider DataProvider
 	// hooks allows per-request overrides for testing faults, etc.
 	hooks map[string]Handler
 }
@@ -34,9 +35,10 @@ type Handler func(ctx context.Context, c *Core, req *dev.Request) (*dev.Response
 
 func NewCore(opts CoreOptions) *Core {
 	c := &Core{
-		opts:    opts,
-		profile: DefaultProfile(),
-		hooks:   map[string]Handler{},
+		opts:     opts,
+		profile:  DefaultProfile(),
+		provider: nil,
+		hooks:    map[string]Handler{},
 	}
 	return c
 }
@@ -44,15 +46,34 @@ func NewCore(opts CoreOptions) *Core {
 // NewCoreWithProfile allows constructing the simulator with a specific profile.
 func NewCoreWithProfile(opts CoreOptions, p Profile) *Core {
 	c := &Core{
-		opts:    opts,
-		profile: p,
-		hooks:   map[string]Handler{},
+		opts:     opts,
+		profile:  p,
+		provider: nil,
+		hooks:    map[string]Handler{},
 	}
 	return c
 }
 
 // With sets a custom handler for a request case key (e.g., "get_status").
 func (c *Core) With(key string, h Handler) { c.hooks[key] = h }
+
+// SetDataProvider sets the active data provider (playback/baseline). Passing nil restores random synthesis.
+func (c *Core) SetDataProvider(p DataProvider) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.provider = p
+}
+
+// getSample returns the next provider sample if a provider is set.
+func (c *Core) getSample() *Sample {
+	c.mu.RLock()
+	p := c.provider
+	c.mu.RUnlock()
+	if p == nil {
+		return nil
+	}
+	return p.Next(time.Now())
+}
 
 // HandleDeviceRequest routes Request.oneof to generator handlers and returns a Response with a default OK status and api_version.
 func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.Response, error) {
@@ -77,9 +98,19 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 	case *dev.Request_GetStatus:
 		// Route to dish or wifi based on target_id (simple heuristic).
 		if tid := strings.ToLower(req.GetTargetId()); strings.Contains(tid, "wifi") || strings.Contains(tid, "router") {
-			resp.Response = &dev.Response_WifiGetStatus{WifiGetStatus: c.randWifiStatus()}
+			sample := c.getSample()
+			if sample != nil && sample.WifiStatus != nil {
+				resp.Response = &dev.Response_WifiGetStatus{WifiGetStatus: sample.WifiStatus}
+			} else {
+				resp.Response = &dev.Response_WifiGetStatus{WifiGetStatus: c.randWifiStatus()}
+			}
 		} else {
-			resp.Response = &dev.Response_DishGetStatus{DishGetStatus: c.randDishStatus()}
+			sample := c.getSample()
+			if sample != nil && sample.DishStatus != nil {
+				resp.Response = &dev.Response_DishGetStatus{DishGetStatus: sample.DishStatus}
+			} else {
+				resp.Response = &dev.Response_DishGetStatus{DishGetStatus: c.randDishStatus()}
+			}
 		}
 	case *dev.Request_DishGetContext:
 		resp.Response = &dev.Response_DishGetContext{DishGetContext: c.randDishContext()}
@@ -102,7 +133,11 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 	case *dev.Request_StartDishSelfTest:
 		resp.Response = &dev.Response_StartDishSelfTest{StartDishSelfTest: &dev.StartDishSelfTestResponse{}}
 	case *dev.Request_WifiGetClients:
-		resp.Response = &dev.Response_WifiGetClients{WifiGetClients: c.randWifiClients()}
+		if sample := c.getSample(); sample != nil && sample.WifiClients != nil {
+			resp.Response = &dev.Response_WifiGetClients{WifiGetClients: sample.WifiClients}
+		} else {
+			resp.Response = &dev.Response_WifiGetClients{WifiGetClients: c.randWifiClients()}
+		}
 	case *dev.Request_WifiGetConfig:
 		resp.Response = &dev.Response_WifiGetConfig{WifiGetConfig: c.randWifiConfig()}
 	case *dev.Request_WifiGetFirewall:

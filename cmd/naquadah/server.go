@@ -11,6 +11,8 @@ import (
 
 	dev "github.com/b0ch3nski/go-starlink/model/api-protoc/device"
 	unlock "github.com/b0ch3nski/go-starlink/model/api-protoc/device/services/unlock"
+	"github.com/b0ch3nski/go-starlink/model/internal/metrics"
+	"github.com/b0ch3nski/go-starlink/model/internal/rules"
 	"github.com/b0ch3nski/go-starlink/model/internal/sim"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
@@ -18,22 +20,48 @@ import (
 
 func run() {
 	var (
-		port    = flag.Int("port", 9200, "gRPC port to listen on")
-		seed    = flag.Int64("seed", time.Now().UnixNano(), "random seed")
-		noisy   = flag.Bool("noisy", false, "log every request")
-		events  = flag.Bool("events", true, "emit periodic events on streams")
-		cfgPath = flag.String("config", "naquadah.yaml", "path to YAML device config")
-		genCfg  = flag.Bool("gen-config", false, "generate a default YAML config at -config and exit")
+		port           = flag.Int("port", 9200, "gRPC port to listen on")
+		seed           = flag.Int64("seed", time.Now().UnixNano(), "random seed")
+		noisy          = flag.Bool("noisy", false, "log every request")
+		events         = flag.Bool("events", true, "emit periodic events on streams")
+		cfgPath        = flag.String("config", "naquadah.yaml", "path to YAML device config")
+		genCfg         = flag.Bool("gen-config", false, "generate a default YAML config at -config and exit")
+		rulesPath      = flag.String("rules", "", "rules YAML path (optional)")
+		genRules       = flag.Bool("gen-rules", false, "write example rules file if missing then exit")
+		recordJSON     = flag.String("record-json", "", "record samples to JSON file (implies random source unless -real-target)")
+		recordInterval = flag.Duration("record-interval", 60*time.Second, "recording interval")
+		playbackJSON   = flag.String("playback-json", "", "playback samples from JSON file")
+		playbackLoop   = flag.Bool("playback-loop", true, "loop playback when end reached")
+		baselineJSON   = flag.String("baseline-json", "", "baseline hybrid samples JSON (adds jitter)")
+		playbackScale  = flag.Float64("playback-scale", 1.0, "playback advancement scale (>1 faster, <1 slower)")
+		metricsAddr    = flag.String("metrics", "", "prometheus metrics listen address (e.g. :9090)")
+		realTarget     = flag.String("real-target", "", "real dish host:port to poll (enables real poller)")
+		realToken      = flag.String("real-token", "", "auth token for real dish (optional)")
+		realTimeout    = flag.Duration("real-timeout", 5*time.Second, "timeout per real dish request")
 	)
 	flag.Parse()
 
 	rand.Seed(*seed)
+
+	if *metricsAddr != "" {
+		metrics.Init(*metricsAddr)
+	}
 
 	if *genCfg {
 		if err := sim.WriteTemplateConfig(*cfgPath, 0o644, false); err != nil {
 			log.Fatalf("write config: %v", err)
 		}
 		log.Printf("Wrote template config to %s\n", *cfgPath)
+		return
+	}
+	if *genRules {
+		if *rulesPath == "" {
+			log.Fatalf("-rules path required with -gen-rules")
+		}
+		if err := rules.WriteTemplate(*rulesPath, 0o644); err != nil {
+			log.Fatalf("write rules: %v", err)
+		}
+		log.Printf("Wrote rules template to %s", *rulesPath)
 		return
 	}
 
@@ -54,7 +82,56 @@ func run() {
 	}
 	core := sim.NewCoreWithProfile(opts, profile)
 
-	dev.RegisterDeviceServer(s, &deviceServer{core: core})
+	// Data provider selection
+	if *playbackJSON != "" || *baselineJSON != "" {
+		prov, err := sim.BuildProvider(*playbackJSON, *playbackLoop, *playbackScale, *baselineJSON, *seed)
+		if err != nil {
+			log.Fatalf("provider: %v", err)
+		}
+		if prov != nil {
+			core.SetDataProvider(prov)
+			log.Printf("Data provider active (%s)", func() string {
+				if *playbackJSON != "" {
+					return "playback"
+				}
+				return "baseline"
+			}())
+		}
+	}
+
+	// Recorder (local synthetic capture). Future real target polling could be added here.
+	if *recordJSON != "" {
+		rec := sim.NewRecorder(core, *recordJSON, *recordInterval)
+		rec.Start()
+		log.Printf("Recording samples every %s to %s", recordInterval.String(), *recordJSON)
+		// No handle to stop; process lifetime.
+	}
+
+	// Real dish polling (parallel to recorder, appends to same file if provided)
+	if *realTarget != "" {
+		pollPath := *recordJSON
+		if pollPath == "" {
+			pollPath = "real_capture.json"
+		}
+		poller, err := sim.NewRealPoller(*realTarget, *recordInterval, *realTimeout, *realToken, pollPath)
+		if err != nil {
+			log.Fatalf("real poller: %v", err)
+		}
+		poller.Start()
+		log.Printf("Real poller active target=%s interval=%s output=%s", *realTarget, recordInterval.String(), pollPath)
+	}
+
+	var ruleEngine *rules.Engine
+	if *rulesPath != "" {
+		eng, err := rules.Load(*rulesPath)
+		if err != nil {
+			log.Fatalf("load rules: %v", err)
+		}
+		ruleEngine = eng
+		log.Printf("Loaded rules from %s", *rulesPath)
+	}
+
+	dev.RegisterDeviceServer(s, &deviceServer{core: core, rules: ruleEngine})
 	dev.RegisterMeshServer(s, &meshServer{core: core})
 	unlock.RegisterUnlockServiceServer(s, &unlockServer{core: core})
 
@@ -66,7 +143,8 @@ func run() {
 
 type deviceServer struct {
 	dev.UnimplementedDeviceServer
-	core *sim.Core
+	core  *sim.Core
+	rules *rules.Engine
 }
 
 func (s *deviceServer) Stream(stream dev.Device_StreamServer) error {
@@ -74,7 +152,30 @@ func (s *deviceServer) Stream(stream dev.Device_StreamServer) error {
 }
 
 func (s *deviceServer) Handle(ctx context.Context, req *dev.Request) (*dev.Response, error) {
-	return s.core.HandleDeviceRequest(ctx, req)
+	start := time.Now()
+	if s.rules != nil {
+		if err := s.rules.ApplyPre(ctx, req); err != nil {
+			return nil, err
+		}
+	}
+	resp, err := s.core.HandleDeviceRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if s.rules != nil {
+		pr := s.rules.ApplyPost(resp, req)
+		if pr.Drop {
+			return nil, nil
+		}
+		if pr.Err != nil {
+			return nil, pr.Err
+		}
+	}
+	// metrics
+	key := fmt.Sprintf("%T", req.GetRequest())
+	metrics.IncRequest(key)
+	metrics.ObserveLatency(key, time.Since(start).Seconds())
+	return resp, nil
 }
 
 type meshServer struct {
