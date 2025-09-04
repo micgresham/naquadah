@@ -129,6 +129,16 @@ naquadah -real-target dish.lan:9200 -real-token SECRET -real-timeout 3s -record-
 
 Extend by editing `internal/sim/provider.go` (`Sample` struct) & recorder logic.
 
+### Component Isolation
+Disable router / WiFi related data while keeping dish telemetry by setting in your YAML config:
+
+```yaml
+enable_router: false
+enable_wifi: false
+```
+
+WiFi endpoints then return minimal empty responses.
+
 ## Rules Engine
 
 Generate template:
@@ -218,6 +228,8 @@ wifi_get_config
 | -real-target | Real dish host:port to poll | (none) |
 | -real-token | Auth token for real dish | (none) |
 | -real-timeout | Per-request timeout for real poller | 5s |
+| (YAML) enable_router | Toggle router/WiFi endpoints | true |
+| (YAML) enable_wifi | Toggle WiFi-related data (alias) | true |
 
 ## Build
 

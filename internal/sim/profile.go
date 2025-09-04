@@ -18,6 +18,10 @@ type Profile struct {
 	RouterSW string
 	SSID     string
 	WiFiPass string
+
+	// Component toggles (allow isolating subsystems)
+	EnableRouter bool // if false, wifi/router related endpoints return minimal or empty
+	EnableWifi   bool // alias for router (kept separate if future divergence)
 }
 
 // DefaultProfile returns a sensible default simulator profile.
@@ -32,9 +36,11 @@ func DefaultProfile() Profile {
 		Lat:    47.6205,
 		Lon:    -122.3493,
 
-		RouterHW: "Router-Gen2",
-		RouterSW: "v0.0.0-sim",
-		SSID:     "Starlink-Sim",
-		WiFiPass: "starlink123",
+		RouterHW:     "Router-Gen2",
+		RouterSW:     "v0.0.0-sim",
+		SSID:         "Starlink-Sim",
+		WiFiPass:     "starlink123",
+		EnableRouter: true,
+		EnableWifi:   true,
 	}
 }

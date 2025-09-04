@@ -26,39 +26,46 @@ type BaseConfig struct {
 	RouterSW string `yaml:"router_sw"`
 	SSID     string `yaml:"ssid"`
 	WiFiPass string `yaml:"wifi_pass"`
+
+	EnableRouter bool `yaml:"enable_router"`
+	EnableWifi   bool `yaml:"enable_wifi"`
 }
 
 // FromProfile converts a Profile to BaseConfig.
 func FromProfile(p Profile) BaseConfig {
 	return BaseConfig{
-		DeviceID: p.DeviceID,
-		SKU:      p.SKU,
-		Country:  p.Country,
-		DishHW:   p.DishHW,
-		DishSW:   p.DishSW,
-		Lat:      p.Lat,
-		Lon:      p.Lon,
-		RouterHW: p.RouterHW,
-		RouterSW: p.RouterSW,
-		SSID:     p.SSID,
-		WiFiPass: p.WiFiPass,
+		DeviceID:     p.DeviceID,
+		SKU:          p.SKU,
+		Country:      p.Country,
+		DishHW:       p.DishHW,
+		DishSW:       p.DishSW,
+		Lat:          p.Lat,
+		Lon:          p.Lon,
+		RouterHW:     p.RouterHW,
+		RouterSW:     p.RouterSW,
+		SSID:         p.SSID,
+		WiFiPass:     p.WiFiPass,
+		EnableRouter: p.EnableRouter,
+		EnableWifi:   p.EnableWifi,
 	}
 }
 
 // ToProfile converts BaseConfig to a simulator Profile.
 func (c BaseConfig) ToProfile() Profile {
 	return Profile{
-		DeviceID: c.DeviceID,
-		SKU:      c.SKU,
-		Country:  c.Country,
-		DishHW:   c.DishHW,
-		DishSW:   c.DishSW,
-		Lat:      c.Lat,
-		Lon:      c.Lon,
-		RouterHW: c.RouterHW,
-		RouterSW: c.RouterSW,
-		SSID:     c.SSID,
-		WiFiPass: c.WiFiPass,
+		DeviceID:     c.DeviceID,
+		SKU:          c.SKU,
+		Country:      c.Country,
+		DishHW:       c.DishHW,
+		DishSW:       c.DishSW,
+		Lat:          c.Lat,
+		Lon:          c.Lon,
+		RouterHW:     c.RouterHW,
+		RouterSW:     c.RouterSW,
+		SSID:         c.SSID,
+		WiFiPass:     c.WiFiPass,
+		EnableRouter: c.EnableRouter,
+		EnableWifi:   c.EnableWifi,
 	}
 }
 
@@ -71,6 +78,13 @@ func WriteTemplateConfig(path string, perm fs.FileMode, overwrite bool) error {
 		}
 	}
 	cfg := FromProfile(DefaultProfile())
+	// Include toggles explicitly in template
+	if cfg.EnableRouter == false {
+		cfg.EnableRouter = true
+	}
+	if cfg.EnableWifi == false {
+		cfg.EnableWifi = true
+	}
 	b, err := yaml.Marshal(&cfg)
 	if err != nil {
 		return err

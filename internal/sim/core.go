@@ -98,6 +98,10 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 	case *dev.Request_GetStatus:
 		// Route to dish or wifi based on target_id (simple heuristic).
 		if tid := strings.ToLower(req.GetTargetId()); strings.Contains(tid, "wifi") || strings.Contains(tid, "router") {
+			if !c.profile.EnableRouter || !c.profile.EnableWifi {
+				resp.Response = &dev.Response_WifiGetStatus{WifiGetStatus: &dev.WifiGetStatusResponse{}}
+				break
+			}
 			sample := c.getSample()
 			if sample != nil && sample.WifiStatus != nil {
 				resp.Response = &dev.Response_WifiGetStatus{WifiGetStatus: sample.WifiStatus}
@@ -133,17 +137,31 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 	case *dev.Request_StartDishSelfTest:
 		resp.Response = &dev.Response_StartDishSelfTest{StartDishSelfTest: &dev.StartDishSelfTestResponse{}}
 	case *dev.Request_WifiGetClients:
-		if sample := c.getSample(); sample != nil && sample.WifiClients != nil {
+		if !c.profile.EnableRouter || !c.profile.EnableWifi {
+			resp.Response = &dev.Response_WifiGetClients{WifiGetClients: &dev.WifiGetClientsResponse{}}
+		} else if sample := c.getSample(); sample != nil && sample.WifiClients != nil {
 			resp.Response = &dev.Response_WifiGetClients{WifiGetClients: sample.WifiClients}
 		} else {
 			resp.Response = &dev.Response_WifiGetClients{WifiGetClients: c.randWifiClients()}
 		}
 	case *dev.Request_WifiGetConfig:
-		resp.Response = &dev.Response_WifiGetConfig{WifiGetConfig: c.randWifiConfig()}
+		if !c.profile.EnableRouter || !c.profile.EnableWifi {
+			resp.Response = &dev.Response_WifiGetConfig{WifiGetConfig: &dev.WifiGetConfigResponse{WifiConfig: &dev.WifiConfig{}}}
+		} else {
+			resp.Response = &dev.Response_WifiGetConfig{WifiGetConfig: c.randWifiConfig()}
+		}
 	case *dev.Request_WifiGetFirewall:
-		resp.Response = &dev.Response_WifiGetFirewall{WifiGetFirewall: c.randWifiFirewall()}
+		if !c.profile.EnableRouter || !c.profile.EnableWifi {
+			resp.Response = &dev.Response_WifiGetFirewall{WifiGetFirewall: &dev.WifiGetFirewallResponse{}}
+		} else {
+			resp.Response = &dev.Response_WifiGetFirewall{WifiGetFirewall: c.randWifiFirewall()}
+		}
 	case *dev.Request_WifiGetPingMetrics:
-		resp.Response = &dev.Response_WifiGetPingMetrics{WifiGetPingMetrics: &dev.WifiGetPingMetricsResponse{}}
+		if !c.profile.EnableRouter || !c.profile.EnableWifi {
+			resp.Response = &dev.Response_WifiGetPingMetrics{WifiGetPingMetrics: &dev.WifiGetPingMetricsResponse{}}
+		} else {
+			resp.Response = &dev.Response_WifiGetPingMetrics{WifiGetPingMetrics: &dev.WifiGetPingMetricsResponse{}}
+		}
 	case *dev.Request_WifiSetup:
 		resp.Response = &dev.Response_WifiSetup{WifiSetup: &dev.WifiSetupResponse{}}
 	case *dev.Request_WifiSetMeshDeviceTrust:
@@ -240,6 +258,10 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 		// For unhandled methods, return a generic OK with no payload.
 		// This keeps the simulator permissive while still implementing the APIs.
 	}
+	// Defensive: ensure a concrete oneof so clients not checking for nil payloads don't panic.
+	if resp.Response == nil {
+		resp.Response = &dev.Response_GetDeviceInfo{GetDeviceInfo: c.randDeviceInfo()}
+	}
 	return resp, nil
 }
 
@@ -326,16 +348,83 @@ func (c *Core) FinishUnlock(ctx context.Context, r *unlock.FinishUnlockRequest) 
 // Random data builders below. Only a subset is needed for a believable dataset.
 
 func (c *Core) randDishStatus() *dev.DishGetStatusResponse {
-	// Minimal realistic values using available fields
+	// Expanded synthetic status approximating real field richness.
+	uptime := uint64(3600 + gmath.Intn(24*3600))
+	alerts := &dev.DishAlerts{
+		MotorsStuck:                false,
+		ThermalThrottle:            gmath.Intn(20) == 0,
+		ThermalShutdown:            false,
+		MastNotNearVertical:        false,
+		UnexpectedLocation:         false,
+		SlowEthernetSpeeds:         gmath.Intn(50) == 0,
+		Roaming:                    false,
+		InstallPending:             gmath.Intn(40) == 0,
+		IsHeating:                  gmath.Intn(30) == 0,
+		PowerSupplyThermalThrottle: gmath.Intn(25) == 0,
+		IsPowerSaveIdle:            gmath.Intn(15) == 0,
+		MovingWhileNotMobile:       false,
+		MovingTooFastForPolicy:     false,
+		DbfTelemStale:              gmath.Intn(100) == 0,
+		LowMotorCurrent:            false,
+		LowerSignalThanPredicted:   gmath.Intn(60) == 0,
+	}
+	gps := &dev.DishGpsStats{GpsValid: true, GpsSats: uint32(30 + gmath.Intn(10))}
+	ob := &dev.DishObstructionStats{
+		FractionObstructed:               gmath.Float32() * 0.05,
+		TimeObstructed:                   gmath.Float32() * 100,
+		ValidS:                           3600,
+		PatchesValid:                     64,
+		AvgProlongedObstructionIntervalS: gmath.Float32()*300 + 100,
+		AvgProlongedObstructionDurationS: gmath.Float32()*30 + 5,
+	}
+	ready := &dev.DishReadyStates{Cady: true, Scp: true, L1L2: true, Xphy: true, Aap: true, Rf: true}
+	align := &dev.AlignmentStats{
+		TiltAngleDeg:                 gmath.Float32()*5 - 2.5,
+		BoresightAzimuthDeg:          gmath.Float32() * 360,
+		BoresightElevationDeg:        20 + gmath.Float32()*50,
+		DesiredBoresightAzimuthDeg:   gmath.Float32() * 360,
+		DesiredBoresightElevationDeg: 20 + gmath.Float32()*50,
+		AttitudeEstimationState:      2,
+		AttitudeUncertaintyDeg:       gmath.Float32()*2 + 0.2,
+	}
+	updStats := &dev.SoftwareUpdateStats{SoftwareUpdateState: dev.SoftwareUpdateState_IDLE, SoftwareUpdateProgress: float32(gmath.Intn(100))}
+	initDur := &dev.InitializationDurationSeconds{
+		AttitudeInitialization: int32(30 + gmath.Intn(40)),
+		BurstDetected:          int32(5 + gmath.Intn(10)),
+		EkfConverged:           int32(20 + gmath.Intn(30)),
+		FirstCplane:            int32(15 + gmath.Intn(20)),
+		FirstPopPing:           int32(25 + gmath.Intn(15)),
+		GpsValid:               int32(10 + gmath.Intn(20)),
+		InitialNetworkEntry:    int32(60 + gmath.Intn(60)),
+		NetworkSchedule:        int32(20 + gmath.Intn(40)),
+		RfReady:                int32(40 + gmath.Intn(30)),
+		StableConnection:       int32(120 + gmath.Intn(120)),
+	}
+	config := &dev.DishConfig{ApplySnowMeltMode: gmath.Intn(10) == 0}
 	return &dev.DishGetStatusResponse{
-		DeviceInfo:            c.randDeviceInfo().GetDeviceInfo(),
-		DeviceState:           &dev.DeviceState{UptimeS: uint64(3600 + gmath.Intn(7200))},
-		PopPingDropRate:       gmath.Float32() * 0.02,
-		PopPingLatencyMs:      20 + gmath.Float32()*40,
-		DownlinkThroughputBps: 50_000_000 + gmath.Float32()*100_000_000,
-		UplinkThroughputBps:   5_000_000 + gmath.Float32()*25_000_000,
-		StowRequested:         false,
-		IsSnrAboveNoiseFloor:  true,
+		DeviceInfo:                    c.randDeviceInfo().GetDeviceInfo(),
+		DeviceState:                   &dev.DeviceState{UptimeS: uptime},
+		Alerts:                        alerts,
+		GpsStats:                      gps,
+		ObstructionStats:              ob,
+		PopPingDropRate:               gmath.Float32() * 0.02,
+		PopPingLatencyMs:              20 + gmath.Float32()*40,
+		DownlinkThroughputBps:         50_000_000 + gmath.Float32()*100_000_000,
+		UplinkThroughputBps:           5_000_000 + gmath.Float32()*25_000_000,
+		BoresightAzimuthDeg:           align.BoresightAzimuthDeg,
+		BoresightElevationDeg:         align.BoresightElevationDeg,
+		EthSpeedMbps:                  1000,
+		MobilityClass:                 dev.UserMobilityClass_STATIONARY,
+		IsSnrAboveNoiseFloor:          true,
+		ReadyStates:                   ready,
+		ClassOfService:                dev.UserClassOfService_BUSINESS,
+		SoftwareUpdateState:           dev.SoftwareUpdateState_IDLE,
+		SoftwareUpdateStats:           updStats,
+		AlignmentStats:                align,
+		DisablementCode:               0,
+		HasSignedCals:                 true,
+		Config:                        config,
+		InitializationDurationSeconds: initDur,
 	}
 }
 
