@@ -66,3 +66,6 @@ Set provider:
 ```go
 core.SetDataProvider(&patternProvider{seq: samples})
 ```
+
+## License
+MIT – see root `LICENSE`.

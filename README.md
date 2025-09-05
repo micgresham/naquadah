@@ -10,6 +10,8 @@ A lightweight (mock) Starlink gRPC simulator and experimentation harness.
 - Deterministic pseudo‑random simulation (seeded)
 - Optional device YAML config (static profile overrides)
 - Rules engine (latency, jitter, field/status overrides, error/drop injection, logging)
+- Embedded Admin Web UI (enable with `-admin :PORT`) for live alarms, field overrides, rain fade & snow simulation, obstruction map, weather path editing
+ - Versioned REST API (`/api/v1/*`) for external admin tooling (see `docs/rest-api.md`) with optional JWT auth (`-auth` flags)
 - Data source modes:
 	- Pure random (default)
 	- Playback of recorded JSON time‑series (scalable with -playback-scale)
@@ -35,6 +37,14 @@ naquadah
 ```
 
 Enable verbose logging & events:
+Launch with admin UI (serve on :8081):
+
+```
+naquadah -admin :8081
+```
+
+Then browse http://localhost:8081/ (see `docs/admin-ui.md`).
+
 
 ```
 naquadah -noisy -events
@@ -230,6 +240,19 @@ wifi_get_config
 | -real-timeout | Per-request timeout for real poller | 5s |
 | (YAML) enable_router | Toggle router/WiFi endpoints | true |
 | (YAML) enable_wifi | Toggle WiFi-related data (alias) | true |
+| -tls | Enable self-signed TLS (experimental) | false |
+| -tls-cert | TLS cert file (with -tls) | (self-signed) |
+| -tls-key | TLS key file (with -tls) | (self-signed) |
+| -mdns | Announce _starlink._tcp via mDNS (TXT: app, ver, proto) | false |
+| -admin | Serve admin web UI at host:port (e.g. :8081) | (disabled) |
+| -admin-no-ui | Suppress embedded UI on -admin listener (API only) | false |
+| -rest | Standalone REST API listener (no UI) | (disabled) |
+| -auth | Enable JWT auth for admin/REST | false |
+| -auth-issuer | Expected JWT issuer | (empty) |
+| -auth-audience | Expected JWT audience | (empty) |
+| -auth-hs256-secret | HS256 shared secret | (empty) |
+| -auth-jwks | JWKS URL | (empty) |
+| -auth-jwks-refresh | JWKS refresh interval | 5m |
 
 ## Build
 
@@ -244,6 +267,10 @@ Cross compile:
 ```
 ./scripts/build.sh
 ```
+
+## License
+
+Licensed under the MIT License. See `LICENSE` for details.
 
 Outputs placed in `dist/`.
 
@@ -281,6 +308,8 @@ Client -> gRPC Server -> Core
 ```
 
 More detail: see `docs/architecture.md` once generated.
+
+Admin UI details: see `docs/admin-ui.md`.
 
 ## Extending
 

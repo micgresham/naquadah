@@ -2,10 +2,12 @@ device_id: ut-0000000000000000
 sku: UT2
 country: US
 dish_hw: Dish-Gen2
-dish_sw: v0.0.0-sim
+dish_sw: v0.9.2-sim
 lat: 47.6205
 lon: -122.3493
 router_hw: Router-Gen2
 router_sw: v0.0.0-sim
 ssid: Starlink-Sim
 wifi_pass: starlink123
+enable_router: true
+enable_wifi: true

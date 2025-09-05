@@ -45,3 +45,6 @@ Rules `error` action returns a gRPC status. `drop` yields nil response (client m
 
 ## Performance & Metrics
 All in-memory; minimal allocations. Export counters & histograms with `-metrics :9090` and scrape `/metrics`.
+
+## License
+MIT License – see root `LICENSE` file.

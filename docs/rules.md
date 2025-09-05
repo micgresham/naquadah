@@ -86,3 +86,6 @@ Use labels to correlate injected delays vs. observed latency.
 2. Implement handling in `ApplyPre` or `ApplyPost`.
 3. Add tests in `internal/rules/engine_test.go`.
 4. Update this document & README.
+
+## License
+MIT – see root `LICENSE`.
