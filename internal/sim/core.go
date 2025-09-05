@@ -235,6 +235,9 @@ func (c *Core) HandleDeviceRequest(ctx context.Context, req *dev.Request) (*dev.
 		resp.Response = &dev.Response_SetTestMode{SetTestMode: &dev.SetTestModeResponse{}}
 	case *dev.Request_SoftwareUpdate:
 		resp.Response = &dev.Response_SoftwareUpdate{SoftwareUpdate: &dev.SoftwareUpdateResponse{}}
+	case *dev.Request_IqCapture:
+		// Provide minimal acknowledgment for IQ capture requests.
+		resp.Response = &dev.Response_GetDeviceInfo{GetDeviceInfo: c.randDeviceInfo()}
 	// case *dev.Request_IqCapture: // no explicit response type in this schema
 	case *dev.Request_GetRadioStats:
 		resp.Response = &dev.Response_GetRadioStats{GetRadioStats: &dev.GetRadioStatsResponse{}}
