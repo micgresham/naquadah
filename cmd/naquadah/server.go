@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"time"
 
 	dev "github.com/b0ch3nski/go-starlink/model/api-protoc/device"
@@ -16,6 +17,8 @@ import (
 	"github.com/b0ch3nski/go-starlink/model/internal/sim"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/keepalive"
+
+	"github.com/b0ch3nski/go-starlink/model/internal/admin"
 )
 
 func run() {
@@ -35,6 +38,7 @@ func run() {
 		baselineJSON   = flag.String("baseline-json", "", "baseline hybrid samples JSON (adds jitter)")
 		playbackScale  = flag.Float64("playback-scale", 1.0, "playback advancement scale (>1 faster, <1 slower)")
 		metricsAddr    = flag.String("metrics", "", "prometheus metrics listen address (e.g. :9090)")
+		adminAddr      = flag.String("admin", "", "admin http listen address (e.g. :8080) for runtime overrides")
 		realTarget     = flag.String("real-target", "", "real dish host:port to poll (enables real poller)")
 		realToken      = flag.String("real-token", "", "auth token for real dish (optional)")
 		realTimeout    = flag.Duration("real-timeout", 5*time.Second, "timeout per real dish request")
@@ -81,6 +85,18 @@ func run() {
 		log.Printf("Loaded config from %s\n", *cfgPath)
 	}
 	core := sim.NewCoreWithProfile(opts, profile)
+
+	// Optional admin state & HTTP server
+	var adminState *admin.State
+	if *adminAddr != "" {
+		adminState = admin.NewState()
+		go func() {
+			log.Printf("admin listening on %s", *adminAddr)
+			if err := http.ListenAndServe(*adminAddr, adminState.Handler()); err != nil {
+				log.Printf("admin server error: %v", err)
+			}
+		}()
+	}
 
 	// Data provider selection
 	if *playbackJSON != "" || *baselineJSON != "" {
@@ -131,7 +147,7 @@ func run() {
 		log.Printf("Loaded rules from %s", *rulesPath)
 	}
 
-	dev.RegisterDeviceServer(s, &deviceServer{core: core, rules: ruleEngine})
+	dev.RegisterDeviceServer(s, &deviceServer{core: core, rules: ruleEngine, admin: adminState})
 	dev.RegisterMeshServer(s, &meshServer{core: core})
 	unlock.RegisterUnlockServiceServer(s, &unlockServer{core: core})
 
@@ -145,6 +161,7 @@ type deviceServer struct {
 	dev.UnimplementedDeviceServer
 	core  *sim.Core
 	rules *rules.Engine
+	admin *admin.State
 }
 
 func (s *deviceServer) Stream(stream dev.Device_StreamServer) error {
@@ -162,6 +179,12 @@ func (s *deviceServer) Handle(ctx context.Context, req *dev.Request) (*dev.Respo
 	if err != nil {
 		return nil, err
 	}
+	// Admin one-shot injected error (highest priority)
+	if s.admin != nil {
+		if ok, code, msg := s.admin.ConsumeError(); ok {
+			return nil, fmt.Errorf("injected error code=%d msg=%s", code, msg)
+		}
+	}
 	if s.rules != nil {
 		pr := s.rules.ApplyPost(resp, req)
 		if pr.Drop {
@@ -169,6 +192,12 @@ func (s *deviceServer) Handle(ctx context.Context, req *dev.Request) (*dev.Respo
 		}
 		if pr.Err != nil {
 			return nil, pr.Err
+		}
+	}
+	// Apply admin overrides (dish status fields & alarms, etc.)
+	if s.admin != nil {
+		if dr, ok := resp.Response.(*dev.Response_DishGetStatus); ok {
+			s.admin.ApplyDish(dr.DishGetStatus)
 		}
 	}
 	// metrics
