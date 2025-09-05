@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/b0ch3nski/go-starlink/model/internal/auth"
+
 	dev "github.com/b0ch3nski/go-starlink/model/api-protoc/device"
 	unlock "github.com/b0ch3nski/go-starlink/model/api-protoc/device/services/unlock"
 	"github.com/b0ch3nski/go-starlink/model/internal/metrics"
@@ -29,33 +31,42 @@ import (
 
 func run() {
 	var (
-		port           = flag.Int("port", 9200, "gRPC port to listen on")
-		seed           = flag.Int64("seed", time.Now().UnixNano(), "random seed")
-		noisy          = flag.Bool("noisy", false, "log every request")
-		events         = flag.Bool("events", true, "emit periodic events on streams")
-		cfgPath        = flag.String("config", "naquadah.yaml", "path to YAML device config")
-		genCfg         = flag.Bool("gen-config", false, "generate a default YAML config at -config and exit")
-		rulesPath      = flag.String("rules", "", "rules YAML path (optional)")
-		genRules       = flag.Bool("gen-rules", false, "write example rules file if missing then exit")
-		recordJSON     = flag.String("record-json", "", "record samples to JSON file (implies random source unless -real-target)")
-		recordInterval = flag.Duration("record-interval", 60*time.Second, "recording interval")
-		playbackJSON   = flag.String("playback-json", "", "playback samples from JSON file")
-		playbackLoop   = flag.Bool("playback-loop", true, "loop playback when end reached")
-		baselineJSON   = flag.String("baseline-json", "", "baseline hybrid samples JSON (adds jitter)")
-		playbackScale  = flag.Float64("playback-scale", 1.0, "playback advancement scale (>1 faster, <1 slower)")
-		metricsAddr    = flag.String("metrics", "", "prometheus metrics listen address (e.g. :9090)")
-		adminAddr      = flag.String("admin", "", "admin http listen address (e.g. :8080) for runtime overrides")
-		useTLS         = flag.Bool("tls", false, "enable self-signed TLS for gRPC (experimental)")
-		mdns           = flag.Bool("mdns", false, "announce _starlink._tcp via mDNS (best-effort)")
-		certFile       = flag.String("tls-cert", "", "optional TLS cert file (overrides self-signed)")
-		keyFile        = flag.String("tls-key", "", "optional TLS key file")
-		realTarget     = flag.String("real-target", "", "real dish host:port to poll (enables real poller)")
-		realToken      = flag.String("real-token", "", "auth token for real dish (optional)")
-		realTimeout    = flag.Duration("real-timeout", 5*time.Second, "timeout per real dish request")
-		rainIntensity  = flag.Float64("rain-fade-intensity", 0, "if >0 start rain fade simulation with given intensity (0-1)")
-		rainDuration   = flag.Duration("rain-fade-duration", 30*time.Second, "rain fade iteration active duration")
-		rainIterations = flag.Int("rain-fade-iterations", 1, "rain fade iterations (0=infinite)")
-		rainDelay      = flag.Duration("rain-fade-delay", 5*time.Second, "delay between rain fade iterations")
+		port            = flag.Int("port", 9200, "gRPC port to listen on")
+		seed            = flag.Int64("seed", time.Now().UnixNano(), "random seed")
+		noisy           = flag.Bool("noisy", false, "log every request")
+		events          = flag.Bool("events", true, "emit periodic events on streams")
+		cfgPath         = flag.String("config", "naquadah.yaml", "path to YAML device config")
+		genCfg          = flag.Bool("gen-config", false, "generate a default YAML config at -config and exit")
+		rulesPath       = flag.String("rules", "", "rules YAML path (optional)")
+		genRules        = flag.Bool("gen-rules", false, "write example rules file if missing then exit")
+		recordJSON      = flag.String("record-json", "", "record samples to JSON file (implies random source unless -real-target)")
+		recordInterval  = flag.Duration("record-interval", 60*time.Second, "recording interval")
+		playbackJSON    = flag.String("playback-json", "", "playback samples from JSON file")
+		playbackLoop    = flag.Bool("playback-loop", true, "loop playback when end reached")
+		baselineJSON    = flag.String("baseline-json", "", "baseline hybrid samples JSON (adds jitter)")
+		playbackScale   = flag.Float64("playback-scale", 1.0, "playback advancement scale (>1 faster, <1 slower)")
+		metricsAddr     = flag.String("metrics", "", "prometheus metrics listen address (e.g. :9090)")
+		adminAddr       = flag.String("admin", "", "admin http listen address (e.g. :8080) for runtime overrides")
+		restAddr        = flag.String("rest", "", "standalone REST API listen address (no embedded UI)")
+		adminNoUI       = flag.Bool("admin-no-ui", false, "disable embedded UI (API only) on -admin listener")
+		useTLS          = flag.Bool("tls", false, "enable self-signed TLS for gRPC (experimental)")
+		mdns            = flag.Bool("mdns", false, "announce _starlink._tcp via mDNS (best-effort)")
+		certFile        = flag.String("tls-cert", "", "optional TLS cert file (overrides self-signed)")
+		keyFile         = flag.String("tls-key", "", "optional TLS key file")
+		realTarget      = flag.String("real-target", "", "real dish host:port to poll (enables real poller)")
+		realToken       = flag.String("real-token", "", "auth token for real dish (optional)")
+		realTimeout     = flag.Duration("real-timeout", 5*time.Second, "timeout per real dish request")
+		rainIntensity   = flag.Float64("rain-fade-intensity", 0, "if >0 start rain fade simulation with given intensity (0-1)")
+		rainDuration    = flag.Duration("rain-fade-duration", 30*time.Second, "rain fade iteration active duration")
+		rainIterations  = flag.Int("rain-fade-iterations", 1, "rain fade iterations (0=infinite)")
+		rainDelay       = flag.Duration("rain-fade-delay", 5*time.Second, "delay between rain fade iterations")
+		shutdownTimeout = flag.Duration("shutdown-timeout", 8*time.Second, "max duration for graceful stop before force")
+		oauthEnable     = flag.Bool("auth", false, "enable OAuth2 (JWT bearer) auth on admin/REST APIs")
+		authIssuer      = flag.String("auth-issuer", "", "expected JWT issuer")
+		authAudience    = flag.String("auth-audience", "", "expected JWT audience")
+		authHS256       = flag.String("auth-hs256-secret", "", "HS256 shared secret (development only)")
+		authJWKS        = flag.String("auth-jwks", "", "JWKS URL for asymmetric key validation")
+		authJWKSRefresh = flag.Duration("auth-jwks-refresh", 5*time.Minute, "JWKS cache refresh interval")
 	)
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Usage = func() {
@@ -68,6 +79,8 @@ func run() {
 		fmt.Fprintf(flag.CommandLine.Output(), "  # Playback previously recorded samples faster (2x)\n  %s -playback-json samples.json -playback-scale 2\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  # Record synthetic samples every 30s\n  %s -record-json out.json -record-interval 30s\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "  # Real dish polling (experimental)\n  %s -real-target host:9200 -real-token TOKEN\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  # Standalone REST API (no UI)\n  %s -rest :8082\n", os.Args[0])
+		fmt.Fprintf(flag.CommandLine.Output(), "  # Admin listener API only (suppress UI)\n  %s -admin :8080 -admin-no-ui\n", os.Args[0])
 		fmt.Fprintf(flag.CommandLine.Output(), "\nVersion: %s\n%s\n%s\n", AppVersion, AppAuthor, AppHomepage)
 	}
 	flag.Parse()
@@ -136,20 +149,42 @@ func run() {
 	}
 	core := sim.NewCoreWithProfile(opts, profile)
 
-	// Optional admin state & HTTP server
+	// Optional admin / REST state & HTTP servers
 	var adminState *admin.State
-	if *adminAddr != "" {
+	if *adminAddr != "" || *restAddr != "" {
 		adminState = admin.NewState()
+	}
+
+	startHTTP := func(addr string, includeUI bool, label string) {
+		if addr == "" {
+			return
+		}
 		go func() {
-			log.Printf("admin listening on %s", *adminAddr)
-			if err := http.ListenAndServe(*adminAddr, adminState.Handler()); err != nil {
-				log.Printf("admin server error: %v", err)
+			log.Printf("%s listening on %s (ui=%v)", label, addr, includeUI)
+			var h http.Handler
+			if *oauthEnable {
+				h = adminState.HandlerWithAuthOptions(auth.Config{Enabled: true, Issuer: *authIssuer, Audience: *authAudience, HS256Secret: *authHS256, JWKSURL: *authJWKS, JWKSRefresh: *authJWKSRefresh}, includeUI)
+			} else {
+				h = adminState.HandlerAPI(includeUI)
+			}
+			if err := http.ListenAndServe(addr, h); err != nil {
+				log.Printf("%s server error: %v", label, err)
 			}
 		}()
-		if *rainIntensity > 0 {
-			adminState.StartRainFade(*rainIntensity, *rainDuration, *rainIterations, *rainDelay)
-			log.Printf("rain fade started intensity=%.2f duration=%s iterations=%d delay=%s", *rainIntensity, rainDuration.String(), *rainIterations, rainDelay.String())
-		}
+	}
+
+	// Start admin combined listener (UI optional)
+	if *adminAddr != "" {
+		startHTTP(*adminAddr, !*adminNoUI, "admin")
+	}
+	// Separate REST-only listener
+	if *restAddr != "" {
+		startHTTP(*restAddr, false, "rest")
+	}
+
+	if adminState != nil && *rainIntensity > 0 {
+		adminState.StartRainFade(*rainIntensity, *rainDuration, *rainIterations, *rainDelay)
+		log.Printf("rain fade started intensity=%.2f duration=%s iterations=%d delay=%s", *rainIntensity, rainDuration.String(), *rainIterations, rainDelay.String())
 	}
 
 	// Data provider selection
@@ -209,17 +244,40 @@ func run() {
 	if *mdns {
 		go announceMDNS(*port)
 	}
-	// Graceful shutdown
+	// Graceful shutdown & signal handling
 	go func() {
 		if err := s.Serve(lis); err != nil {
 			log.Printf("serve ended: %v", err)
 		}
 	}()
-	sigCh := make(chan os.Signal, 1)
+
+	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-	log.Printf("shutdown signal received; stopping gRPC server")
-	s.GracefulStop()
+	first := <-sigCh
+	log.Printf("shutdown signal received (%v); initiating graceful shutdown", first)
+
+	// Start graceful gRPC stop in background so we can time out
+	grpcStopped := make(chan struct{})
+	go func() { s.GracefulStop(); close(grpcStopped) }()
+
+	// If second signal arrives, force stop immediately
+	go func() {
+		second := <-sigCh
+		log.Printf("second signal (%v) forcing immediate shutdown", second)
+		s.Stop()
+	}()
+
+	// Wait for graceful or timeout
+	select {
+	case <-grpcStopped:
+		log.Printf("gRPC server stopped gracefully")
+	case <-time.After(*shutdownTimeout):
+		log.Printf("graceful shutdown timed out after %s; forcing stop", shutdownTimeout.String())
+		s.Stop()
+	}
+
+	// Allow a brief moment for logs to flush
+	time.Sleep(200 * time.Millisecond)
 }
 
 type deviceServer struct {

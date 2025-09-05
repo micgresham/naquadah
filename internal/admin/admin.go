@@ -12,32 +12,27 @@ import (
 	"time"
 
 	dev "github.com/b0ch3nski/go-starlink/model/api-protoc/device"
+	"github.com/b0ch3nski/go-starlink/model/internal/auth"
 )
 
-// State holds mutable simulation overrides controlled via the admin UI.
+// State holds override and weather simulation state for the admin UI.
 type State struct {
-	mu sync.RWMutex
-
-	// Alarm overrides map dish alert field name -> bool
-	alarms map[string]bool
-
-	// Field overrides applied after synthetic generation; key path -> float64
-	fields map[string]float64
-	// Raw (string) field overrides (string/enum/bool/numeric as text)
+	mu        sync.RWMutex
+	alarms    map[string]bool
+	fields    map[string]float64
 	rawFields map[string]string
 
-	// Error injection: if set, next matching request returns gRPC status code/message (handled in server layer)
 	ErrorNext struct {
 		Enable bool
 		Code   int32
 		Msg    string
 	}
 
-	// Obstruction grid override (8x8). nil => use generated.
 	obstruction []float32
 
 	// Latest synthesized (weather) obstruction grid (8x8) when no manual override
-	weatherGrid []float32
+	weatherGrid   []float32
+	effectiveGrid []float32
 
 	// Rain fade simulation
 	rain struct {
@@ -74,10 +69,13 @@ type State struct {
 
 	// lastDish snapshot for UI impacted fields section
 	lastDish *dev.DishGetStatusResponse
+
+	// lastAlerts holds the most recently synthesized dish alerts (dynamic + effects)
+	lastAlerts map[string]bool
 }
 
 func NewState() *State {
-	return &State{alarms: map[string]bool{}, fields: map[string]float64{}, rawFields: map[string]string{}}
+	return &State{alarms: map[string]bool{}, fields: map[string]float64{}, rawFields: map[string]string{}, lastAlerts: map[string]bool{}}
 }
 
 // ApplyDish mutates a generated dish status response in-place according to overrides.
@@ -264,55 +262,45 @@ func (s *State) ApplyDish(d *dev.DishGetStatusResponse) {
 		d.ObstructionStats.FractionObstructed = float32(holes) / 64.0
 	}
 
-	// If no manual obstruction override, synthesize dynamic weather map (8x8) applying snow + rain
-	if len(s.obstruction) != 64 {
-		combined, _, _ := s.buildWeatherGrid()
-		if d.ObstructionStats != nil {
-			obstructed := 0
-			for _, v := range combined {
-				if v == 0 {
-					obstructed++
-				}
-			}
-			frac := float32(obstructed) / 64.0
-			if d.ObstructionStats.FractionObstructed == 0 {
-				d.ObstructionStats.FractionObstructed = frac
-			} else {
-				d.ObstructionStats.FractionObstructed = (d.ObstructionStats.FractionObstructed*0.6 + frac*0.4)
-			}
+	// Always synthesize dynamic weather grid
+	combinedWeather, _, _ := s.buildWeatherGrid()
+	// Compose effective grid: manual holes (if any) override weather (logical AND since 0 means obstructed)
+	effective := make([]float32, 64)
+	for i := 0; i < 64; i++ {
+		mw := combinedWeather[i]
+		if len(s.obstruction) == 64 { // manual mask exists
+			mw = mw * s.obstruction[i]
 		}
-		// store snapshot asynchronously to avoid write during RLock
-		gridCopy := make([]float32, len(combined))
-		copy(gridCopy, combined)
-		go func(g []float32) {
-			s.mu.Lock()
-			s.weatherGrid = g
-			s.mu.Unlock()
-		}(gridCopy)
+		effective[i] = mw
 	}
-	// ensure obstruction stats not lower than actual current grid state (manual or weather)
 	if d.ObstructionStats != nil {
-		var gref []float32
-		if len(s.obstruction) == 64 {
-			gref = s.obstruction
-		} else if len(s.weatherGrid) == 64 {
-			gref = s.weatherGrid
+		obstructed := 0
+		for _, v := range effective {
+			if v == 0 {
+				obstructed++
+			}
 		}
-		if len(gref) == 64 {
-			ob := 0
-			for _, v := range gref {
-				if v == 0 {
-					ob++
-				}
-			}
-			baseFrac := float32(ob) / 64.0
-			if baseFrac > d.ObstructionStats.FractionObstructed {
-				d.ObstructionStats.FractionObstructed = baseFrac
-			}
+		frac := float32(obstructed) / 64.0
+		// Blend for smoother transitions
+		if d.ObstructionStats.FractionObstructed == 0 {
+			d.ObstructionStats.FractionObstructed = frac
+		} else {
+			d.ObstructionStats.FractionObstructed = (d.ObstructionStats.FractionObstructed*0.5 + frac*0.5)
 		}
 	}
+	// store weather + effective copies asynchronously
+	go func(wg, eg []float32) {
+		wCopy := make([]float32, 64)
+		copy(wCopy, wg)
+		eCopy := make([]float32, 64)
+		copy(eCopy, eg)
+		s.mu.Lock()
+		s.weatherGrid = wCopy
+		s.effectiveGrid = eCopy
+		s.mu.Unlock()
+	}(combinedWeather, effective)
 
-	// capture key fields for UI (avoid heavy copy). Do outside RLock via goroutine.
+	// capture key fields + alerts for UI (avoid heavy copy). Do outside RLock via goroutine.
 	clone := &dev.DishGetStatusResponse{DownlinkThroughputBps: d.DownlinkThroughputBps, UplinkThroughputBps: d.UplinkThroughputBps, PopPingLatencyMs: d.PopPingLatencyMs, PopPingDropRate: d.PopPingDropRate}
 	if d.ObstructionStats != nil {
 		clone.ObstructionStats = &dev.DishObstructionStats{FractionObstructed: d.ObstructionStats.FractionObstructed}
@@ -320,7 +308,32 @@ func (s *State) ApplyDish(d *dev.DishGetStatusResponse) {
 	if d.GpsStats != nil {
 		clone.GpsStats = &dev.DishGpsStats{GpsSats: d.GpsStats.GpsSats, GpsValid: d.GpsStats.GpsValid}
 	}
-	go func(cpy *dev.DishGetStatusResponse) { s.mu.Lock(); s.lastDish = cpy; s.mu.Unlock() }(clone)
+	// build alerts map (dynamic actual alerts, not just manual overrides)
+	alertsMap := map[string]bool{}
+	if d.Alerts != nil {
+		alertsMap["motors_stuck"] = d.Alerts.MotorsStuck
+		alertsMap["thermal_throttle"] = d.Alerts.ThermalThrottle
+		alertsMap["thermal_shutdown"] = d.Alerts.ThermalShutdown
+		alertsMap["mast_not_near_vertical"] = d.Alerts.MastNotNearVertical
+		alertsMap["unexpected_location"] = d.Alerts.UnexpectedLocation
+		alertsMap["slow_ethernet_speeds"] = d.Alerts.SlowEthernetSpeeds
+		alertsMap["roaming"] = d.Alerts.Roaming
+		alertsMap["install_pending"] = d.Alerts.InstallPending
+		alertsMap["is_heating"] = d.Alerts.IsHeating
+		alertsMap["power_supply_thermal_throttle"] = d.Alerts.PowerSupplyThermalThrottle
+		alertsMap["is_power_save_idle"] = d.Alerts.IsPowerSaveIdle
+		alertsMap["moving_while_not_mobile"] = d.Alerts.MovingWhileNotMobile
+		alertsMap["moving_too_fast_for_policy"] = d.Alerts.MovingTooFastForPolicy
+		alertsMap["dbf_telem_stale"] = d.Alerts.DbfTelemStale
+		alertsMap["low_motor_current"] = d.Alerts.LowMotorCurrent
+		alertsMap["lower_signal_than_predicted"] = d.Alerts.LowerSignalThanPredicted
+	}
+	go func(cpy *dev.DishGetStatusResponse, am map[string]bool) {
+		s.mu.Lock()
+		s.lastDish = cpy
+		s.lastAlerts = am
+		s.mu.Unlock()
+	}(clone, alertsMap)
 }
 
 // buildWeatherGrid returns combined (0 obstructed), snow layer, rain layer
@@ -448,6 +461,26 @@ func (s *State) SetObstructionHole(x, y int) {
 	s.obstruction[internalY*8+x] = 0
 }
 
+// SetObstructionValue sets a specific cell to 0 or 1 (manual override grid created lazily).
+func (s *State) SetObstructionValue(x, y int, val int) {
+	if x < 0 || y < 0 || x >= 8 || y >= 8 {
+		return
+	}
+	if val != 0 && val != 1 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.obstruction == nil {
+		s.obstruction = make([]float32, 64)
+		for i := range s.obstruction {
+			s.obstruction[i] = 1
+		}
+	}
+	internalY := 7 - y
+	s.obstruction[internalY*8+x] = float32(val)
+}
+
 func (s *State) RandomizeObstruction() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -493,13 +526,15 @@ func (s *State) Snapshot() map[string]interface{} {
 		}
 	}
 	return map[string]interface{}{
-		"alarms":       s.alarms,
-		"fields":       s.fields,
-		"raw_fields":   s.rawFields,
-		"error_next":   s.ErrorNext,
-		"obstruction":  s.obstruction,
-		"weather_grid": s.weatherGrid,
-		"last_dish":    last,
+		"alarms":         s.alarms,
+		"effective_grid": s.effectiveGrid,
+		"dish_alerts":    s.lastAlerts,
+		"fields":         s.fields,
+		"raw_fields":     s.rawFields,
+		"error_next":     s.ErrorNext,
+		"obstruction":    s.obstruction,
+		"weather_grid":   s.weatherGrid,
+		"last_dish":      last,
 		"rain": map[string]interface{}{
 			"active":      s.rain.Active,
 			"intensity":   s.rain.Intensity,
@@ -535,7 +570,11 @@ func (s *State) ConsumeError() (bool, int32, string) {
 }
 
 // HTTP wiring
-func (s *State) Handler() http.Handler {
+// Handler returns full admin UI + API (legacy behavior).
+func (s *State) Handler() http.Handler { return s.HandlerAPI(true) }
+
+// HandlerAPI returns only API endpoints; includeUI optionally adds embedded HTML UI.
+func (s *State) HandlerAPI(includeUI bool) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/alarms", s.handleAlarms)
 	mux.HandleFunc("/api/fields", s.handleFields)
@@ -544,8 +583,42 @@ func (s *State) Handler() http.Handler {
 	mux.HandleFunc("/api/rainfade", s.handleRainFade)
 	mux.HandleFunc("/api/snow", s.handleSnow)
 	mux.HandleFunc("/api/weather", s.handleWeather)
-	mux.HandleFunc("/", serveIndex)
+	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "ts": time.Now().Unix()})
+	})
+	// Versioned endpoints
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "ts": time.Now().Unix()})
+	})
+	mux.HandleFunc("/api/v1/alarms", s.handleAlarms)
+	mux.HandleFunc("/api/v1/fields", s.handleFields)
+	mux.HandleFunc("/api/v1/error", s.handleError)
+	mux.HandleFunc("/api/v1/obstruction", s.handleObstruction)
+	mux.HandleFunc("/api/v1/rainfade", s.handleRainFade)
+	mux.HandleFunc("/api/v1/snow", s.handleSnow)
+	mux.HandleFunc("/api/v1/weather", s.handleWeather)
+	if includeUI {
+		mux.HandleFunc("/", serveIndex)
+	}
 	return mux
+}
+
+// HandlerWithAuth returns handler with UI + auth.
+func (s *State) HandlerWithAuth(cfg auth.Config) http.Handler {
+	return s.HandlerWithAuthOptions(cfg, true)
+}
+
+// HandlerWithAuthOptions returns handler with optional UI + auth.
+func (s *State) HandlerWithAuthOptions(cfg auth.Config, includeUI bool) http.Handler {
+	base := s.HandlerAPI(includeUI)
+	if !cfg.Enabled {
+		return base
+	}
+	v := auth.New(cfg)
+	return v.Middleware(base)
 }
 
 // Weather endpoint: GET returns snapshot with weather grid; POST updates path / extra cells
@@ -666,6 +739,7 @@ func (s *State) handleObstruction(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			X         *int `json:"x"`
 			Y         *int `json:"y"`
+			Value     *int `json:"value"`
 			Randomize bool `json:"randomize"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -675,7 +749,11 @@ func (s *State) handleObstruction(w http.ResponseWriter, r *http.Request) {
 		if body.Randomize {
 			s.RandomizeObstruction()
 		} else if body.X != nil && body.Y != nil {
-			s.SetObstructionHole(*body.X, *body.Y)
+			if body.Value != nil {
+				s.SetObstructionValue(*body.X, *body.Y, *body.Value)
+			} else {
+				s.SetObstructionHole(*body.X, *body.Y)
+			}
 		}
 		s.respondJSON(w, s.Snapshot())
 	case http.MethodGet:
@@ -956,28 +1034,39 @@ func (s *State) snowAttenuationFactor() float64 {
 
 // applyRainEffects clamps values after applying
 func (s *State) applyRainEffects(d *dev.DishGetStatusResponse, sev float64) {
-	// Throughput degrade
+	// Stronger throughput & signal degradation: full severity => complete drop (0 bps)
 	if d.DownlinkThroughputBps > 0 {
-		d.DownlinkThroughputBps *= float32(1 - 0.7*sev)
+		scale := 1 - 0.95*sev
+		if sev >= 0.999 {
+			scale = 0
+		}
+		if scale < 0 {
+			scale = 0
+		}
+		d.DownlinkThroughputBps *= float32(scale)
 	}
 	if d.UplinkThroughputBps > 0 {
-		d.UplinkThroughputBps *= float32(1 - 0.7*sev)
+		scale := 1 - 0.95*sev
+		if sev >= 0.999 {
+			scale = 0
+		}
+		if scale < 0 {
+			scale = 0
+		}
+		d.UplinkThroughputBps *= float32(scale)
 	}
-	if d.DownlinkThroughputBps < 1 {
-		d.DownlinkThroughputBps = 1
-	}
-	if d.UplinkThroughputBps < 1 {
-		d.UplinkThroughputBps = 1
-	}
-	d.PopPingLatencyMs += float32(40 * sev)
-	d.PopPingDropRate += float32(0.05 * sev)
-	if d.PopPingDropRate > 0.99 {
-		d.PopPingDropRate = 0.99
+	// Latency growth (non-linear)
+	d.PopPingLatencyMs += float32(120 * math.Pow(sev, 1.1))
+	// Drop rate pushes toward near total at high severity
+	d.PopPingDropRate += float32(0.70 * math.Pow(sev, 1.3))
+	if d.PopPingDropRate > 0.995 {
+		d.PopPingDropRate = 0.995
 	}
 	if d.ObstructionStats == nil {
 		d.ObstructionStats = &dev.DishObstructionStats{}
 	}
-	d.ObstructionStats.FractionObstructed += float32(0.15 * sev)
+	// Slightly stronger obstruction contribution
+	d.ObstructionStats.FractionObstructed += float32(0.22 * sev)
 	if d.ObstructionStats.FractionObstructed > 1 {
 		d.ObstructionStats.FractionObstructed = 1
 	}
@@ -987,15 +1076,26 @@ func (s *State) applyRainEffects(d *dev.DishGetStatusResponse, sev float64) {
 	if d.GpsStats == nil {
 		d.GpsStats = &dev.DishGpsStats{}
 	}
+	// GPS satellites: stronger non‑linear reduction with rain severity.
 	baseSats := d.GpsStats.GpsSats
 	if baseSats == 0 {
 		baseSats = 30
 	}
-	loss := uint32(float64(baseSats) * (0.5 + 0.4*sev) * sev) // stronger toward zero
+	// Factor curve: mild impact early, accelerates after sev>0.4
+	// lossFrac ~ (0.12 + 0.78*sev) * sev^0.9  (caps below 0.9)
+	lossFrac := (0.12 + 0.78*sev) * math.Pow(sev, 0.9)
+	if lossFrac > 0.9 {
+		lossFrac = 0.9
+	}
+	loss := uint32(float64(baseSats) * lossFrac)
 	if loss >= baseSats {
 		loss = baseSats - 1
 	}
-	d.GpsStats.GpsSats = baseSats - loss
+	remaining := baseSats - loss
+	if remaining < 4 {
+		remaining = 4
+	} // keep a sensible floor to avoid zero
+	d.GpsStats.GpsSats = remaining
 	if sev > 0.85 {
 		d.GpsStats.GpsValid = false
 	}
@@ -1017,19 +1117,37 @@ func (s *State) applyRainEffects(d *dev.DishGetStatusResponse, sev float64) {
 }
 
 func (s *State) applySnowEffects(d *dev.DishGetStatusResponse, sev float64) {
-	// Snow slower throughput hit but more obstruction
+	// Snow throughput impact: slightly less aggressive than rain until high sev, then collapse
 	if d.DownlinkThroughputBps > 0 {
-		d.DownlinkThroughputBps *= float32(1 - 0.4*sev)
+		scale := 1 - 0.85*sev
+		if sev >= 0.999 {
+			scale = 0
+		}
+		if scale < 0 {
+			scale = 0
+		}
+		d.DownlinkThroughputBps *= float32(scale)
 	}
 	if d.UplinkThroughputBps > 0 {
-		d.UplinkThroughputBps *= float32(1 - 0.4*sev)
+		scale := 1 - 0.85*sev
+		if sev >= 0.999 {
+			scale = 0
+		}
+		if scale < 0 {
+			scale = 0
+		}
+		d.UplinkThroughputBps *= float32(scale)
 	}
-	d.PopPingLatencyMs += float32(20 * sev)
-	d.PopPingDropRate += float32(0.03 * sev)
+	// Latency & drop (gentler than rain)
+	d.PopPingLatencyMs += float32(80 * math.Pow(sev, 1.1))
+	d.PopPingDropRate += float32(0.50 * math.Pow(sev, 1.2))
+	if d.PopPingDropRate > 0.99 {
+		d.PopPingDropRate = 0.99
+	}
 	if d.ObstructionStats == nil {
 		d.ObstructionStats = &dev.DishObstructionStats{}
 	}
-	d.ObstructionStats.FractionObstructed += float32(0.25 * sev)
+	d.ObstructionStats.FractionObstructed += float32(0.30 * sev)
 	if d.ObstructionStats.FractionObstructed > 1 {
 		d.ObstructionStats.FractionObstructed = 1
 	}
@@ -1043,11 +1161,17 @@ func (s *State) applySnowEffects(d *dev.DishGetStatusResponse, sev float64) {
 	if baseSats == 0 {
 		baseSats = 30
 	}
-	loss := uint32(float64(baseSats) * 0.3 * sev)
+	// Snow reduces a bit less aggressively; quadratic easing.
+	lossFrac := 0.4 * (sev * sev) // max 0.4 at sev=1
+	loss := uint32(float64(baseSats) * lossFrac)
 	if loss >= baseSats {
 		loss = baseSats - 1
 	}
-	d.GpsStats.GpsSats = baseSats - loss
+	remaining := baseSats - loss
+	if remaining < 5 {
+		remaining = 5
+	}
+	d.GpsStats.GpsSats = remaining
 	// Simulate heater (is_heating alert) when snow severity moderate
 	if d.Alerts == nil {
 		d.Alerts = &dev.DishAlerts{}
@@ -1055,9 +1179,12 @@ func (s *State) applySnowEffects(d *dev.DishGetStatusResponse, sev float64) {
 	if sev > 0.2 {
 		d.Alerts.IsHeating = true
 	}
-	// At heavy accumulation raise slow ethernet (simulated power/thermal issues) and lower signal alert
+	// At heavy accumulation raise lower signal alert & possibly invalidate GPS
 	if sev > 0.7 {
 		d.Alerts.LowerSignalThanPredicted = true
+	}
+	if sev > 0.85 {
+		d.GpsStats.GpsValid = false
 	}
 }
 
@@ -1110,6 +1237,9 @@ details summary{cursor:pointer;font-weight:600;color:var(--accent)}
 .flex-row{display:flex;flex-wrap:wrap;align-items:center;gap:.75rem}
 hr{border:none;border-top:1px solid var(--border);margin:8px 0}
 a{text-decoration:none;color:var(--accent-alt)}
+.hb-status{position:fixed;bottom:8px;right:12px;font-size:.65rem;padding:4px 8px;border-radius:6px;background:#22333a;color:#9ecbff;opacity:.85;z-index:999;transition:.25s}
+.hb-status.bad{background:#471d1d;color:#ffb4b4}
+.hb-status.warn{background:#463d22;color:#ffe6a1}
 </style></head><body><header><h1>Naquadah Admin</h1><span style="font-size:.75rem;opacity:.6">Weather & Overrides</span>
 <div style="margin-left:auto;display:flex;align-items:center;gap:.5rem;font-size:.75rem">
 	<button id="manualRefresh" style="padding:4px 8px">Refresh Now</button>
@@ -1138,6 +1268,33 @@ a{text-decoration:none;color:var(--accent-alt)}
 		<button onclick="clearCustomField()">Clear Custom</button>
 	</div>
 	<div style="margin-top:6px"><strong>Active:</strong> <span id="fields"></span></div>
+</section>
+<section>
+	<h2>Combined Grid / Storm Path</h2>
+	<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
+		<div style="position:relative;padding-left:22px;padding-top:18px;display:inline-block">
+			<div id="weatherXLabels" style="position:absolute;top:0;left:22px;display:flex;gap:0"></div>
+			<div id="weatherYLabels" style="position:absolute;left:0;top:18px;display:flex;flex-direction:column;gap:0"></div>
+			<canvas id="weatherCanvas" width="160" height="160" title="8x8 Combined Grid"></canvas>
+			<div style="font-size:12px;margin-top:4px;max-width:260px">Legend: black=obstructed (weather or manual), green=clear. Yellow outline = manual-only override. Click toggles manual cell. Randomize seeds manual holes. Clear Manual removes all overrides.</div>
+		</div>
+		<div style="min-width:230px">
+			<div><strong>Rain Path</strong></div>
+			<label>SX<input id="pathSX" size=2 value="0"/></label>
+			<label>SY<input id="pathSY" size=2 value="0"/></label>
+			<label>EX<input id="pathEX" size=2 value="7"/></label>
+			<label>EY<input id="pathEY" size=2 value="7"/></label>
+			<button onclick="updatePath()">Update</button>
+			<hr/>
+			<div><strong>Extra Rain Cells</strong></div>
+			<div id="extraCells" style="font-size:12px"></div>
+			<label>X<input id="cellX" size=2/></label>
+			<label>Y<input id="cellY" size=2/></label>
+			<button onclick="addCell()">Add</button>
+			<button onclick="clearManual()">Clear Manual Override</button>
+			<button onclick="randomize()">Randomize</button>
+		</div>
+	</div>
 </section>
 <section>
 	<h2>Error Injection (next request only)</h2>
@@ -1194,42 +1351,6 @@ a{text-decoration:none;color:var(--accent-alt)}
 		<div class="kv" id="snowFields"></div>
 	</details>
 </section>
-<section>
-	<h2>Obstruction Map</h2>
-	<div id="gridWrapper">
-		<div id="gridXLabels"></div>
-		<div id="gridYLabels"></div>
-		<div id="grid"></div>
-	</div>
-	<button onclick="randomize()">Randomize</button>
-</section>
-<section>
-	<h2>Weather Grid / Storm Path</h2>
-	<div style="display:flex;gap:1rem;flex-wrap:wrap;align-items:flex-start">
-		<div style="position:relative;padding-left:22px;padding-top:18px;display:inline-block">
-			<div id="weatherXLabels" style="position:absolute;top:0;left:22px;display:flex;gap:0">
-			</div>
-			<div id="weatherYLabels" style="position:absolute;left:0;top:18px;display:flex;flex-direction:column;gap:0"></div>
-			<canvas id="weatherCanvas" width="160" height="160" title="8x8 Weather Grid (axes 0-7)"></canvas>
-			<div style="font-size:12px;margin-top:4px">Legend: black=obstructed, green=clear. Weather grid origin (0,0) top-left; obstruction map origin top-left.</div>
-		</div>
-		<div style="min-width:210px">
-			<div><strong>Rain Path</strong></div>
-			<label>SX<input id="pathSX" size=2 value="0"/></label>
-			<label>SY<input id="pathSY" size=2 value="0"/></label>
-			<label>EX<input id="pathEX" size=2 value="7"/></label>
-			<label>EY<input id="pathEY" size=2 value="7"/></label>
-			<button onclick="updatePath()">Update</button>
-			<hr/>
-			<div><strong>Extra Rain Cells</strong></div>
-			<div id="extraCells" style="font-size:12px"></div>
-			<label>X<input id="cellX" size=2/></label>
-			<label>Y<input id="cellY" size=2/></label>
-			<button onclick="addCell()">Add</button>
-			<button onclick="clearManual()">Clear Manual Override</button>
-		</div>
-	</div>
-</section>
 <script>
 const ALARMS=[ 'motors_stuck','thermal_throttle','thermal_shutdown','mast_not_near_vertical','unexpected_location','slow_ethernet_speeds','roaming','install_pending','is_heating','power_supply_thermal_throttle','is_power_save_idle','moving_while_not_mobile','moving_too_fast_for_policy','dbf_telem_stale','low_motor_current','lower_signal_than_predicted'];
 const FIELDS=[ {group:'Throughput',items:[ {key:'dish.downlink_throughput_bps',label:'Downlink (bps)'}, {key:'dish.uplink_throughput_bps',label:'Uplink (bps)'}]}, {group:'Latency / Loss',items:[ {key:'dish.pop_ping_latency_ms',label:'POP Ping Latency (ms)'}, {key:'dish.pop_ping_drop_rate',label:'POP Ping Drop Rate'}]}, {group:'Radio Geometry',items:[ {key:'dish.boresight_azimuth_deg',label:'Boresight Azimuth (deg)'}, {key:'dish.boresight_elevation_deg',label:'Boresight Elevation (deg)'}]}, {group:'Environment',items:[ {key:'dish.obstruction_fraction',label:'Obstruction Fraction'}]}, {group:'Software Update',items:[ {key:'dish.software_update_progress_pct',label:'Update Progress (%)'}]}, {group:'Device',items:[ {key:'dish.eth_speed_mbps',label:'Ethernet Speed (Mbps)'}, {key:'dish.uptime_s',label:'Uptime (s)'}]},];
@@ -1244,13 +1365,13 @@ function init(){ const fs=document.getElementById('fieldSelect'); FIELDS.forEach
  const wx=document.getElementById('weatherXLabels'); if(wx){wx.innerHTML=''; for(let x=0;x<8;x++){let s=document.createElement('div');s.style.width='20px';s.style.textAlign='center';s.style.fontSize='10px';s.style.color='#ccc';s.textContent=x;wx.appendChild(s);} }
  const wy=document.getElementById('weatherYLabels'); if(wy){wy.innerHTML=''; for(let y=0;y<8;y++){let s=document.createElement('div');s.style.height='20px';s.style.display='flex';s.style.alignItems='center';s.style.justifyContent='center';s.style.fontSize='10px';s.style.color='#ccc';s.style.width='20px';s.textContent=y;wy.appendChild(s);} }
  document.getElementById('manualRefresh').onclick=()=>refresh(true); document.getElementById('autoToggle').onchange=()=>scheduleRefresh(); document.getElementById('refreshInterval').onchange=()=>scheduleRefresh(); updateRainDisplay(); refresh(true); }
-async function refresh(manual){let s=await fetch('/api/alarms').then(r=>r.json()); renderAlarms(s.alarms||{}); let merged={};Object.assign(merged,s.fields||{});Object.assign(merged,s.raw_fields||{}); document.getElementById('fields').textContent=JSON.stringify(merged);
+async function refresh(manual){let s=await fetch('/api/alarms').then(r=>r.json()); window.__snapshotDishAlerts = s.dish_alerts || {}; renderAlarms(s.alarms||{}); let merged={};Object.assign(merged,s.fields||{});Object.assign(merged,s.raw_fields||{}); document.getElementById('fields').textContent=JSON.stringify(merged);
  // Prefer explicit manual obstruction grid if present (length 64). Otherwise use weather/effective grid.
  let gridRef=[]; if(s.obstruction && s.obstruction.length===64){ gridRef=s.obstruction; } else if(s.effective_grid && s.effective_grid.length===64){ gridRef=s.effective_grid; } else if(s.weather_grid && s.weather_grid.length===64){ gridRef=s.weather_grid; }
  renderGrid(gridRef);
  if(s.rain){document.getElementById('rainStatus').textContent='Rain: '+(s.rain.active?'ACTIVE':'idle')+' iter '+s.rain.iter+'/'+(s.rain.iterations||'∞')+' intensity '+(s.rain.intensity).toFixed(3);} if(s.snow){document.getElementById('snowStatus').textContent='Snow: '+(s.snow.active?'ACTIVE':'idle')+' iter '+s.snow.iter+'/'+(s.snow.iterations||'∞')+' intensity '+(s.snow.intensity*10).toFixed(1);} if(s.last_dish){updateImpacts(s.last_dish);} fetchWeather(); if(!manual){} scheduleRefresh(); }
 function updateImpacts(d){let fields=[ ['Downlink (bps)',d.downlink_bps], ['Uplink (bps)',d.uplink_bps], ['POP Latency (ms)',d.pop_ping_latency_ms], ['POP Drop Rate',d.pop_ping_drop_rate], ['Obstruction Frac',d.obstruction_fraction], ['GPS Sats',d.gps_sats], ['GPS Valid',d.gps_valid] ];let rainF=document.getElementById('rainFields');let snowF=document.getElementById('snowFields');rainF.innerHTML='';snowF.innerHTML='';fields.forEach(f=>{let l=document.createElement('div');l.className='label';l.textContent=f[0];let v=document.createElement('div');v.textContent=f[1];rainF.appendChild(l.cloneNode(true));rainF.appendChild(v.cloneNode(true));snowF.appendChild(l);snowF.appendChild(v);});}
-function renderAlarms(active){ALARMS.forEach(a=>{let b=document.getElementById('alarm-'+a);if(!b)return; if(active[a]) b.classList.add('active'); else b.classList.remove('active');});}
+function renderAlarms(overrides){const dyn=window.__snapshotDishAlerts||{};const merged={...dyn,...overrides};ALARMS.forEach(a=>{let b=document.getElementById('alarm-'+a);if(!b)return; if(merged[a]) b.classList.add('active'); else b.classList.remove('active');});}
 function toggleAlarm(name){const btn=document.getElementById('alarm-'+name);const willEnable=!btn.classList.contains('active');fetch('/api/alarms',{method:'POST',body:JSON.stringify({name:name,value:willEnable})});setTimeout(refresh,200)}
 function clearAlarms(){fetch('/api/alarms',{method:'POST',body:JSON.stringify({name:'__clear_all__'})});setTimeout(refresh,200)}
 function setField(){let key=document.getElementById('fieldSelect').value;let v=parseFloat(document.getElementById('fieldVal').value);if(isNaN(v))return;fetch('/api/fields',{method:'POST',body:JSON.stringify({name:key,value:v})});setTimeout(refresh,200)}
@@ -1268,30 +1389,25 @@ function startRain(){let raw=parseFloat(rainIntensity.value)||5;let I=logMap(raw
 function stopRain(){fetch('/api/rainfade',{method:'POST',body:JSON.stringify({action:'stop'})});setTimeout(refresh,500)}
 function startSnow(){let I=parseFloat(snowIntensity.value)||6;I=I/10;let D=parseFloat(snowDuration.value)||60;let N=parseInt(snowIterations.value)||1;let L=parseFloat(snowDelay.value)||0;fetch('/api/snow',{method:'POST',body:JSON.stringify({action:'start',intensity:I,duration_s:D,iterations:N,delay_s:L})});setTimeout(refresh,500)}
 function stopSnow(){fetch('/api/snow',{method:'POST',body:JSON.stringify({action:'stop'})});setTimeout(refresh,500)}
-function renderGrid(arr){let g=document.getElementById('grid');g.innerHTML='';for(let i=0;i<64;i++){let v=arr[i];let d=document.createElement('div');if(v===0)d.classList.add('hole');d.onclick=()=>{let x=i%8,y=Math.floor(i/8);let uiY=7 - y;fetch('/api/obstruction',{method:'POST',body:JSON.stringify({x:x,y:uiY})}).then(()=>setTimeout(refresh,150));};g.appendChild(d)}}
+function renderGrid(arr){let g=document.getElementById('grid'); if(!g) return; g.innerHTML='';for(let i=0;i<64;i++){let v=arr[i];let d=document.createElement('div');if(v===0)d.classList.add('hole');d.onclick=()=>{let x=i%8,y=Math.floor(i/8);let uiY=7 - y;let isHole=v===0;let newVal=isHole?1:0;fetch('/api/obstruction',{method:'POST',body:JSON.stringify({x:x,y:uiY,value:newVal})}).then(()=>setTimeout(refresh,150));};g.appendChild(d)}}
 function randomize(){fetch('/api/obstruction',{method:'POST',body:JSON.stringify({randomize:true})}).then(r=>r.json()).then(s=>{ if(s && s.obstruction){ renderGrid(s.obstruction);} setTimeout(refresh,300); })}
-async function fetchWeather(){let w=await fetch('/api/weather').then(r=>r.json()); if(w.rain&&w.rain.path){pathSX.value=w.rain.path.start_x;pathSY.value=w.rain.path.start_y;pathEX.value=w.rain.path.end_x;pathEY.value=w.rain.path.end_y;} if(w.rain&&w.rain.extra_cells){renderExtraCells(w.rain.extra_cells);} if(w.weather_grid){drawWeather(w.weather_grid);} }
-function drawWeather(grid){
-	let c=document.getElementById('weatherCanvas');if(!c)return;let ctx=c.getContext('2d');
-	let sz=20; // size of each cell
-	ctx.clearRect(0,0,c.width,c.height);
-	ctx.font='10px monospace';
-	ctx.textAlign='center';
-	ctx.textBaseline='middle';
-	// Draw cells
-	for(let y=0;y<8;y++){
-		for(let x=0;x<8;x++){
-			let v=grid[y*8+x];
-			ctx.fillStyle=v===0?'#000':'#2e7d32';
-			ctx.fillRect(x*sz,y*sz,sz,sz);
-		}
+async function fetchWeather(){let w=await fetch('/api/weather').then(r=>r.json()); if(w.rain&&w.rain.path){pathSX.value=w.rain.path.start_x;pathSY.value=w.rain.path.start_y;pathEX.value=w.rain.path.end_x;pathEY.value=w.rain.path.end_y;} if(w.rain&&w.rain.extra_cells){renderExtraCells(w.rain.extra_cells);} let grid = (w.effective_grid && w.effective_grid.length===64)?w.effective_grid:(w.weather_grid||[]); let manual = w.obstruction||[]; drawWeather(grid, manual, w.rain); }
+function drawWeather(grid, manual, rainState){
+ let c=document.getElementById('weatherCanvas'); if(!c)return; let ctx=c.getContext('2d'); let sz=20; ctx.clearRect(0,0,c.width,c.height);
+ for(let y=0;y<8;y++){
+	for(let x=0;x<8;x++){
+		let idx=y*8+x; let v=grid[idx]; let m = (manual&&manual.length===64)?manual[idx]:1; // manual hole makes it obstructed regardless of dynamic
+		let obstructed = (v===0)||(m===0);
+		ctx.fillStyle = obstructed ? '#000' : '#2e7d32';
+		ctx.fillRect(x*sz,y*sz,sz,sz);
+		// highlight manual override hole (outline) if dynamic also obstructed? Add border accent
+		if(m===0 && v!==0){ ctx.strokeStyle='#ffcc00'; ctx.lineWidth=2; ctx.strokeRect(x*sz+2,y*sz+2,sz-4,sz-4); }
 	}
-	// Grid lines
-	ctx.strokeStyle='#333';
-	for(let i=0;i<=8;i++){
-		ctx.beginPath();ctx.moveTo(0,i*sz);ctx.lineTo(8*sz,i*sz);ctx.stroke();
-		ctx.beginPath();ctx.moveTo(i*sz,0);ctx.lineTo(i*sz,8*sz);ctx.stroke();
-	}
+ }
+ ctx.strokeStyle='#333'; ctx.lineWidth=1; for(let i=0;i<=8;i++){ ctx.beginPath();ctx.moveTo(0,i*sz);ctx.lineTo(8*sz,i*sz);ctx.stroke(); ctx.beginPath();ctx.moveTo(i*sz,0);ctx.lineTo(i*sz,8*sz);ctx.stroke(); }
+ // Click interaction toggle manual
+ c.onclick=(ev)=>{ let rect=c.getBoundingClientRect(); let x=Math.floor((ev.clientX-rect.left)/sz); let y=Math.floor((ev.clientY-rect.top)/sz); if(x<0||y<0||x>7||y>7)return; let uiY=7 - y; let idx=y*8+x; let manualHas = (manual && manual.length===64); let currentManual = manualHas?manual[idx]:1; // manual value 0 means obstructed override
+ let newVal = currentManual===0 ? 1 : 0; fetch('/api/obstruction',{method:'POST',body:JSON.stringify({x:x,y:uiY,value:newVal})}).then(()=>setTimeout(refresh,150)); };
 }
 function updatePath(){
 	let sx=parseInt(pathSX.value)||0;let sy=parseInt(pathSY.value)||0;let ex=parseInt(pathEX.value)||7;let ey=parseInt(pathEY.value)||7;
@@ -1305,6 +1421,16 @@ function renderExtraCells(cells){currentCells=cells.slice();let div=document.get
 function saveCells(){fetch('/api/weather',{method:'POST',body:JSON.stringify({extra_rain_cells:currentCells})});setTimeout(refresh,300)}
 function clearManual(){fetch('/api/weather',{method:'POST',body:JSON.stringify({clear_manual:true})});setTimeout(refresh,300)}
 init();
+// Heartbeat / keep-alive monitor
+let hbEl=document.createElement('div');hbEl.className='hb-status';hbEl.textContent='connecting…';document.body.appendChild(hbEl);
+let lastOK=Date.now();let hbFailures=0;let hbInterval=4000;async function heartbeat(){
+	try{let r=await fetch('/api/health',{cache:'no-store'}); if(!r.ok) throw new Error('bad status'); let j=await r.json(); lastOK=Date.now(); hbFailures=0; hbEl.textContent='healthy '+new Date(j.ts*1000).toLocaleTimeString(); hbEl.className='hb-status'; }
+	catch(e){ hbFailures++; let ago=(Date.now()-lastOK)/1000; hbEl.textContent='unresponsive ('+ago.toFixed(0)+'s)'; hbEl.className='hb-status '+(ago>30?'bad':(ago>10?'warn':'')); }
+	// exponential-ish backoff after multiple failures
+	let next = hbFailures===0?4000: Math.min(15000, 4000 * (1+hbFailures));
+	setTimeout(heartbeat,next);
+}
+heartbeat();
  </script></body></html>`
 
 // applyReflectOverrideNumeric tries to set a numeric path (dot-separated using json tag names)

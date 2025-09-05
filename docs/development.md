@@ -64,3 +64,6 @@ Cross build:
 - Add GitHub Actions CI matrix build
 - Introduce benchmark tests for request throughput
 - Protoreflect-driven dynamic endpoint coverage test
+
+## License
+MIT – refer to root `LICENSE`.

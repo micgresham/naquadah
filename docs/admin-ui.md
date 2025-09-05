@@ -30,11 +30,15 @@ Simulates a moving rain cell across the 8x8 weather grid.
 ### Snow Accumulation
 Adds obstruction and moderate throughput / latency impact. Durations & delays also in seconds. For heavier accumulation the `lower_signal_than_predicted` alarm may assert.
 
-### Obstruction Map (Manual Override)
-8x8 grid (bottom‑left origin). Click cells to carve holes (black). External axis labels: X across the top (0‑7), Y along the left (0 at bottom ascending upward). "Randomize" seeds a sparse pattern. Clearing manual override occurs via Weather section (Clear Manual Override button).
-
-### Weather Grid / Storm Path
-Shows synthesized combined grid (rain + snow) when no manual obstruction override. Axis labels X top / Y left (top‑left origin). Configure a rain path (start/end coordinates) and add extra rain cells. Coordinates for manual extra cells use bottom‑left origin in the UI and are converted internally.
+### Combined Grid / Storm Path
+A single 8x8 canvas now merges manual obstruction overrides with weather effects (rain & snow):
+* Green = clear, Black = obstructed by weather and/or manual override
+* Yellow outline = manually obstructed cell when weather is currently clear there
+* Click a cell to toggle manual state (0 ↔ 1)
+* Randomize seeds a new manual pattern (≈10% obstructed)
+* Clear Manual removes all manual overrides (reverts to pure weather grid)
+* Axis labels: X along top (0‑7); Y along left (top origin visually, click handler converts from bottom‑left semantics for inputs)
+* Rain path and extra cells overlay dynamically; manual cells blend via logical AND (manual 0 forces obstruction)
 
 ### Refresh Controls
 Header provides:
@@ -49,10 +53,11 @@ The scheduler re‑arms after each successful refresh. Set to a small value for 
 | `/api/alarms` | GET/POST | Get or toggle alarms (`name`, `value`) |
 | `/api/fields` | POST | Set/clear numeric (`value`) or raw (`raw`) field override |
 | `/api/error` | POST | Next request error injection |
-| `/api/obstruction` | GET/POST | Get current snapshot or modify obstruction grid (x,y or `randomize`) |
+| `/api/obstruction` | GET/POST | Get snapshot or modify obstruction grid (x,y,[value], `randomize`) – `value` enables toggle explicit set 0/1 |
 | `/api/rainfade` | GET/POST | Start/stop rain fade (accepts `duration_s`,`delay_s` or legacy `_ms`) |
 | `/api/snow` | GET/POST | Start/stop snow accumulation (same second/legacy fields) |
 | `/api/weather` | GET/POST | Get weather snapshot or set rain path / extra cells / clear manual obstruction |
+| `/api/health` | GET | Lightweight keep‑alive (JSON: `{ok:true, ts}`) polled by UI heartbeat |
 | `/` | GET | Serves the SPA HTML |
 
 ## Request Bodies (Examples)
@@ -82,7 +87,8 @@ Manual obstruction hole (bottom‑origin Y):
 * `alarms` – active alarm overrides
 * `fields` / `raw_fields` – applied overrides
 * `obstruction` – manual obstruction grid (if active)
-* `weather_grid` – synthesized dynamic grid (when manual override absent)
+* `weather_grid` – synthesized dynamic (rain/snow) grid (pre‑composition)
+* `effective_grid` – dynamic grid composed with manual (AND) presented when manual override active
 * `rain` – state (`active`, `intensity`, `duration_ms`, `delay_ms`, path, extra_cells)
 * `snow` – state (same pattern)
 * `last_dish` – lightweight subset of last synthesized dish metrics for UI impact table
@@ -90,21 +96,28 @@ Manual obstruction hole (bottom‑origin Y):
 Note: Snapshot still exposes `duration_ms` / `delay_ms` for backward compatibility; control endpoints accept both seconds and legacy millisecond names.
 
 ## Coordinate Systems
-* Obstruction map UI: bottom‑left origin for user input.
-* Weather grid: top‑left origin internally and visually.
-* Extra rain cells: UI entry uses bottom‑left, converted to top‑left internally.
+* Combined grid visually uses top‑left origin.
+* Manual click handling converts to legacy bottom‑origin for API (`y_ui` -> `7 - y_visual`).
+* Extra rain cell entry fields accept bottom‑left coordinates; converted internally to top‑left.
 
 ## Alarm Auto‑Behavior
 * `lower_signal_than_predicted` auto‑enabled when rain severity ≥0.65 or heavy snow (sev>0.7) and auto‑cleared below thresholds if not manually forced.
+* `is_heating` asserted during moderate+ snow accumulation.
 
 ## Version Info
 CLI embeds description, author, homepage and version (`AppVersion` in `cmd/naquadah/constants.go`). `--help` displays common usage examples plus the version footer.
 
+## Heartbeat / Keep‑Alive
+The UI polls `/api/health` every 4s (backing off on errors). Status chip:
+* Healthy – last success timestamp
+* Warn – >10s since last success
+* Bad – >30s since last success (server likely down/hung)
+
 ## Roadmap Additions (related to Admin UI)
 Planned ideas:
 * Scenario scripting panel
-* Time travel / playback controls for recorded sequences
 * Export current override profile to JSON
+* WebSocket push for reduced polling
 * Theming toggle (light/dark)
 
 ---
