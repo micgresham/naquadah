@@ -1,6 +1,6 @@
 # Admin Web UI
 
-The built‑in admin interface (enable with `-admin :8081`) provides real‑time control and visibility into the simulator.
+The built‑in admin interface (enable with `-admin :8081`) provides real‑time control and visibility into the simulator. Run API only with `-admin :8081 -admin-no-ui` or on a separate REST-only port using `-rest :8082`.
 
 ## Enable
 

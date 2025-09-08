@@ -49,6 +49,7 @@ func run() {
 		adminAddr       = flag.String("admin", "", "admin http listen address (e.g. :8080) for runtime overrides")
 		restAddr        = flag.String("rest", "", "standalone REST API listen address (no embedded UI)")
 		adminNoUI       = flag.Bool("admin-no-ui", false, "disable embedded UI (API only) on -admin listener")
+		realRecordJSON  = flag.String("real-record-json", "", "record ONLY real dish samples to JSON file (used with -real-target)")
 		useTLS          = flag.Bool("tls", false, "enable self-signed TLS for gRPC (experimental)")
 		mdns            = flag.Bool("mdns", false, "announce _starlink._tcp via mDNS (best-effort)")
 		certFile        = flag.String("tls-cert", "", "optional TLS cert file (overrides self-signed)")
@@ -204,26 +205,34 @@ func run() {
 		}
 	}
 
-	// Recorder (local synthetic capture). Future real target polling could be added here.
-	if *recordJSON != "" {
+	// Recorder (local synthetic capture). Skip if dedicated real-only recording is requested.
+	if *recordJSON != "" && *realRecordJSON == "" {
 		rec := sim.NewRecorder(core, *recordJSON, *recordInterval)
 		rec.Start()
-		log.Printf("Recording samples every %s to %s", recordInterval.String(), *recordJSON)
+		log.Printf("Recording synthetic samples every %s to %s", recordInterval.String(), *recordJSON)
 		// No handle to stop; process lifetime.
 	}
 
-	// Real dish polling (parallel to recorder, appends to same file if provided)
+	// Real dish polling (parallel). If -real-record-json provided, use that exclusively (never mix with sim file).
 	if *realTarget != "" {
-		pollPath := *recordJSON
-		if pollPath == "" {
-			pollPath = "real_capture.json"
+		pollPath := *realRecordJSON
+		if pollPath == "" { // fallback to prior behavior only if dedicated real path not set
+			if *recordJSON != "" {
+				pollPath = *recordJSON // legacy mixed capture
+			} else {
+				pollPath = "real_capture.json"
+			}
 		}
 		poller, err := sim.NewRealPoller(*realTarget, *recordInterval, *realTimeout, *realToken, pollPath)
 		if err != nil {
 			log.Fatalf("real poller: %v", err)
 		}
 		poller.Start()
-		log.Printf("Real poller active target=%s interval=%s output=%s", *realTarget, recordInterval.String(), pollPath)
+		mode := "mixed"
+		if *realRecordJSON != "" {
+			mode = "real-only"
+		}
+		log.Printf("Real poller active target=%s interval=%s output=%s mode=%s", *realTarget, recordInterval.String(), pollPath, mode)
 	}
 
 	var ruleEngine *rules.Engine

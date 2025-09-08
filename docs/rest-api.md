@@ -93,6 +93,11 @@ Toggle manual obstruction cell:
 curl -H "Authorization: Bearer $TOKEN" -X POST :8081/api/v1/obstruction -d '{"x":3,"y":2,"value":0}'
 ```
 
+Real-only polling example (no simulator samples mixed):
+```bash
+naquadah -real-target 192.168.100.1:9200 -real-record-json real_only.json -record-interval 30s
+```
+
 ## Extending
 Add a new endpoint by wiring a handler in `internal/admin/admin.go` under both `/api/*` and `/api/v1/*` (legacy + versioned). Update this doc and bump minor version if additive.
 

@@ -21,6 +21,8 @@
 - Safety fallback ensuring every response carries a non-nil oneof payload (prevents client panics)
 - Endpoint coverage baseline guard test (`internal/sim/coverage_test.go`)
 - Real dish polling mode (`-real-target`, `-real-token`, `-real-timeout`) with periodic capture
+- Real-only capture isolation via `-real-record-json` (prevents mixing sim & real samples)
+- Separate REST-only listener (`-rest`) and UI suppression flag (`-admin-no-ui`)
 - Recorder & poller: include speedtest, ping-all, transceiver placeholder fields
 - Prometheus metrics exporter (request counts, rule hits, latency histograms) via `-metrics` flag
 - Accelerated playback scaling factor (`-playback-scale`)
