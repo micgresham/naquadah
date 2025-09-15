@@ -6,7 +6,7 @@ Client --> gRPC Server --> Core
                       +--> Data Provider (random / playback / baseline)
                       +--> Config Profile (YAML)
                       +--> Rules Engine (pre/post)
-                      +--> Recorder / Real Poller (optional)
+                      +--> Recorder (sim) / Real Poller (optional, separate real-only file)
                       +--> Metrics Exporter (Prometheus)
 ```
 
@@ -26,9 +26,14 @@ Client --> gRPC Server --> Core
 Encapsulate metric sourcing. If provider returns nil sample, random synthesis proceeds.
 
 ## Recorder / Real Poller
-Recorder: synthetic snapshots.
-Real Poller: polls actual dish endpoints when `-real-target` set, appending to the same JSON stream.
-Both write atomically via temp file rename.
+Recorder: synthetic (simulated) snapshots written when `-record-json` set.
+Real Poller: polls actual dish endpoints when `-real-target` set.
+
+Capture modes:
+* Mixed (legacy): specify `-real-target` and `-record-json` only – real samples appended into the simulator file.
+* Real-only: add `-real-record-json real_only.json` – real samples written exclusively there; simulator recorder (if any) is skipped to avoid contamination.
+
+Both writers use atomic temp file rename.
 
 ## Thread Safety
 - Provider swap under RWMutex

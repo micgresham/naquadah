@@ -6,5 +6,5 @@ const (
 	AppDescription = "Naquadah Starlink Dish Simulator"
 	AppAuthor      = "Author: Naquadah Contributors"
 	AppHomepage    = "https://github.com/micgresham/naquadah"
-	AppVersion     = "0.9.2"
+	AppVersion     = "0.9.3"
 )

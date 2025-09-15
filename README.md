@@ -6,23 +6,12 @@ A lightweight (mock) Starlink gRPC simulator and experimentation harness.
 
 ## Features
 
-- gRPC server (default port 9200) implementing Device, Mesh, Unlock services
-- Deterministic pseudo‑random simulation (seeded)
-- Optional device YAML config (static profile overrides)
-- Rules engine (latency, jitter, field/status overrides, error/drop injection, logging)
-- Embedded Admin Web UI (enable with `-admin :PORT`) for live alarms, field overrides, rain fade & snow simulation, obstruction map, weather path editing
- - Versioned REST API (`/api/v1/*`) for external admin tooling (see `docs/rest-api.md`) with optional JWT auth (`-auth` flags)
-- Data source modes:
 	- Pure random (default)
 	- Playback of recorded JSON time‑series (scalable with -playback-scale)
 	- Baseline hybrid (recorded samples + jitter)
 	- Sample recorder (synthetic snapshots every N seconds)
-	- Real dish polling (append real samples with -real-target)
-- Prometheus metrics exporter (-metrics) counting requests, rule hits, latency
-- Cross‑platform build script (Linux / macOS arm/intel / Windows)
-- Extensible action & provider architecture
 
-## Quick Start
+ Embedded Admin Web UI (enable with `-admin :PORT`) for live alarms, field overrides, rain fade & snow simulation, obstruction map, weather path editing (suppress UI with `-admin-no-ui` or run separate REST-only via `-rest :PORT`)
 
 Generate a template device config:
 
@@ -33,8 +22,10 @@ naquadah -gen-config -config naquadah.yaml
 Run with defaults (random mode):
 
 ```
-naquadah
-```
+  # Real dish polling (legacy mixed capture)
+  %s -real-target host:9200 -record-json mixed.json
+  # Real dish polling (real-only capture)
+  %s -real-target host:9200 -real-record-json real_only.json
 
 Enable verbose logging & events:
 Launch with admin UI (serve on :8081):
@@ -238,6 +229,7 @@ wifi_get_config
 | -real-target | Real dish host:port to poll | (none) |
 | -real-token | Auth token for real dish | (none) |
 | -real-timeout | Per-request timeout for real poller | 5s |
+| -real-record-json | JSON file to write ONLY real dish samples (no sim data) | (none) |
 | (YAML) enable_router | Toggle router/WiFi endpoints | true |
 | (YAML) enable_wifi | Toggle WiFi-related data (alias) | true |
 | -tls | Enable self-signed TLS (experimental) | false |

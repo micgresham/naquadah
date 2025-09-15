@@ -21,6 +21,11 @@ Cross build:
 ./scripts/build.sh
 ```
 
+Real-only capture example (avoid simulator data mixing):
+```
+go run ./cmd/naquadah -real-target 192.168.100.1:9200 -real-record-json real_only.json -record-interval 30s
+```
+
 ## Adding a Rule Action
 1. Extend `Action` struct in `internal/rules/engine.go`.
 2. Implement logic in `ApplyPre` or `ApplyPost`.

@@ -16,6 +16,8 @@ type DataProvider interface {
 | Playback | -playback-json file.json | None (timeline replay; scale with -playback-scale) |
 | Baseline Hybrid | -baseline-json file.json | Light jitter (+/-5%) |
 | Recording (synthetic) | -record-json file.json | Captures simulator random baseline snapshots |
+| Real Polling (mixed) | -real-target host:port [-record-json file.json] | Appends real samples into sim file (legacy) |
+| Real Polling (real-only) | -real-target host:port -real-record-json real.json | Real samples only, never mixed |
 
 ## Playback
 Samples are re-based to simulator start; playback advances with wall time. If `-playback-loop` is true, index resets at end.
@@ -27,7 +29,13 @@ Cycles through captured samples applying small jitter to selected numeric fields
 `Recorder` (started with `-record-json`) captures simulator-generated snapshots every interval (default 60s) and appends them to a JSON file.
 
 ### Real Dish Polling
-Enable with `-real-target host:port` (optionally `-real-token` and `-real-timeout`). Poller issues a subset of real requests (dish & wifi status, clients, speedtest, ping) at the same interval and appends samples to the recorder file (or `real_capture.json` if no recorder active). Fields not returned remain omitted.
+Enable with `-real-target host:port` (optionally `-real-token` and `-real-timeout`). Poller issues a subset of real requests (dish & wifi status, clients, speedtest, ping) at the same interval.
+
+Capture selection:
+* Mixed mode: omit `-real-record-json`; if `-record-json` set, real data appended there, else defaults to `real_capture.json`.
+* Real-only mode: set `-real-record-json`; simulator recorder is suppressed so file contains only authentic samples.
+
+Fields not returned by the real device remain omitted.
 
 ## JSON Schema
 ```json
